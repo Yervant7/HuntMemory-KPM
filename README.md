@@ -4,7 +4,7 @@
 
 ---
 
-## Reuirements
+## Requirements
 
 **KernelPatch or its forks, minimum version 0.13.2**
 **Kernel Linux Version 4.14+ arm64**
