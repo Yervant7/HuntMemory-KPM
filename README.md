@@ -1,6 +1,13 @@
 # HuntMemory-KPM
 
-**HuntMemory-KPM** is a KernelPatch Module (KPM) for Android kernels ranging from **4.14** up to **6.12**.
+**HuntMemory-KPM** is a KernelPatch Module (KPM) for Android kernels ranging from **4.14** up to **6.12** (theoretically).
+
+---
+
+## Reuirements
+
+**KernelPatch or its forks, minimum version 0.13.2**
+**Kernel Linux Version 4.14+ arm64**
 
 ---
 
