@@ -1,0 +1,4 @@
+[submodule "KPM-Headers"]
+	path = KPM-Headers
+	url = https://github.com/Yervant7/KPM-Manager.git
+	branch = KPM-Headers
