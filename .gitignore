@@ -7,11 +7,6 @@
 *.obj
 *.elf
 
-# Linker output
-*.ilk
-*.map
-*.exp
-
 # Precompiled Headers
 *.gch
 *.pch
@@ -28,28 +23,13 @@
 *.so.*
 *.dylib
 
-# Executables
-*.exe
-*.out
-*.app
-*.i*86
-*.x86_64
-*.hex
+build/*
 
-# Debug files
-*.dSYM/
-*.su
-*.idb
-*.pdb
+# 
+*.bin
+*.elf
 
-# Kernel Module Compile Results
-*.mod*
-*.cmd
-.tmp_versions/
-modules.order
-Module.symvers
-Mkfile.old
-dkms.conf
+*.kpm
 
-# debug information files
-*.dwo
+# 
+private
