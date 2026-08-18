@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v7
+        with:
+          submodules: "recursive"
+          fetch-depth: 0
+
+      - name: Install Compiler
+        run: |
+          curl -fL -o arm-gnu-toolchain.tar.xz \
+            https://armkeil.blob.core.windows.net/developer/Files/downloads/gnu/12.2.rel1/binrel/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf.tar.xz
+          tar -Jxf arm-gnu-toolchain.tar.xz
+
+      - name: Extract version from source
+        id: vars
+        run: |
+          VERSION=$(grep -oP 'KPM_VERSION\("?\K[^")]+' hmkpm.c)
+          if [ -z "$VERSION" ]; then
+            echo "ERROR: Could not extract version from hmkpm.c"
+            exit 1
+          fi
+          echo "Extracted version: $VERSION"
+          echo "VERSION=$VERSION" >> $GITHUB_OUTPUT
+
+      - name: Build KPM
+        run: |
+          export PATH="$(pwd)/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf/bin:$PATH"
+          make
+          if [ ! -f hmkpm.kpm ]; then
+            echo "ERROR: hmkpm.kpm not found after build"
+            exit 1
+          fi
+
+      - name: Create Release
+        uses: ncipollo/release-action@v1.21.0
+        with:
+          tag: ${{ steps.vars.outputs.VERSION }}
+          name: Release ${{ steps.vars.outputs.VERSION }}
+          artifacts: |
+            hmkpm.kpm
+            LICENSE
+          token: ${{ secrets.GITHUB_TOKEN }}
+          allowUpdates: true
+          makeLatest: true
+          replacesArtifacts: true
