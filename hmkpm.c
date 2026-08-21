@@ -5,6 +5,7 @@
  * KernelPatch Module (KPM) - [HMKPM]
  */
 
+#include <asm/current.h>
 #include <common.h>
 #include <compiler.h>
 #include <hook.h>
@@ -21,7 +22,7 @@
 #include <uapi/asm-generic/unistd.h>
 
 KPM_NAME("HMKPM");
-KPM_VERSION("2.2.0");
+KPM_VERSION("2.3.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Yervant7");
 KPM_DESCRIPTION("A KernelPatch Module (KPM) HMKPM");
@@ -32,12 +33,14 @@ static int mmap_lock_sem_offset = -1;
 
 struct rw_semaphore;
 extern bool is_su_allow_uid(uid_t uid);
+extern int kp_kconfig_enabled(const char *name) __attribute__((weak));
 
 #define U64_MAX				((u64)~0ULL)
 #define HMKPM_TAG			"[HMKPM] "
 
-#define hmkpm_info(fmt, ...)		logki(HMKPM_TAG fmt, ##__VA_ARGS__)
-#define hmkpm_error(fmt, ...)		logke(HMKPM_TAG fmt, ##__VA_ARGS__)
+#define hmkpm_info(fmt, ...)        logki(HMKPM_TAG fmt, ##__VA_ARGS__)
+#define hmkpm_warn(fmt, ...)        logkw(HMKPM_TAG fmt, ##__VA_ARGS__)
+#define hmkpm_error(fmt, ...)       logke(HMKPM_TAG fmt, ##__VA_ARGS__)
 
 static inline void make_cfi_name(char *dst, size_t dst_size, const char *name)
 {
@@ -175,6 +178,8 @@ static uint64_t pgt_page_offset;
 static uint64_t pgt_linear_voffset;
 static uint64_t pgt_page_shift;
 static uint64_t pgt_page_size;
+static uint64_t pgt_pgd_align_mask;
+static uint64_t pgt_pgd_size;
 static uint64_t pgt_page_level;
 static uint64_t pgt_user_limit;
 static uint64_t pgt_phys_limit;
@@ -189,6 +194,105 @@ static inline uint64_t pgt_phys_to_virt(uint64_t phys)
 static inline uint64_t pgt_virt_to_phys(uint64_t addr)
 {
 	return addr - pgt_linear_voffset;
+}
+
+/* ========================================================================
+ * Software PAN (CONFIG_ARM64_SW_TTBR0_PAN) Support
+ * ======================================================================== */
+
+static bool sw_pan_checked = false;
+static bool sw_pan_enabled = false;
+static uint64_t reserved_ttbr0_val = 0;
+
+static void hmkpm_check_sw_pan_lazy(void)
+{
+	if (likely(sw_pan_checked))
+		return;
+
+	/* 1. Check via kp_kconfig_enabled (lazy check after boot completed) */
+	if (kp_kconfig_enabled && kp_kconfig_enabled("CONFIG_ARM64_SW_TTBR0_PAN")) {
+		sw_pan_enabled = true;
+	}
+
+	/* 2. Check if reserved_ttbr0 symbol exists in kernel */
+	unsigned long sym_reserved = hmkpm_lookup_symbol("reserved_ttbr0");
+	if (sym_reserved) {
+		uint64_t pa = 0;
+		if (hmkpm_copy_from_kernel_nofault(&pa, (const void *)sym_reserved, sizeof(pa)) == 0 && pa) {
+			reserved_ttbr0_val = pa;
+			sw_pan_enabled = true;
+		}
+	}
+
+	/* 3. Check CPU Hardware PAN support via ID_AA64MMFR1_EL1 */
+	if (!sw_pan_enabled && sym_reserved) {
+		uint64_t mmfr1;
+		asm volatile("mrs %0, id_aa64mmfr1_el1" : "=r"(mmfr1));
+		if (((mmfr1 >> 20) & 0xFULL) == 0) {
+			sw_pan_enabled = true;
+		}
+	}
+
+	sw_pan_checked = true;
+	if (sw_pan_enabled) {
+		hmkpm_info("SW PAN detected: reserved_ttbr0=0x%llx\n", reserved_ttbr0_val);
+	}
+}
+
+static inline uint64_t hmkpm_uaccess_enable(void)
+{
+	uint64_t old_ttbr0 = 0;
+
+	hmkpm_check_sw_pan_lazy();
+
+	if (unlikely(sw_pan_enabled)) {
+		asm volatile("mrs %0, ttbr0_el1" : "=r"(old_ttbr0));
+		struct task_struct *cur = current;
+		if (cur && kf_get_task_mm && kf_mmput) {
+			struct mm_struct *mm = kfunc(get_task_mm)(cur);
+			if (mm) {
+				uint64_t cur_pgd_va = 0;
+				if (mm_struct_offset.pgd_offset >= 0) {
+					hmkpm_copy_from_kernel_nofault(&cur_pgd_va,
+						(const void *)((uintptr_t)mm + mm_struct_offset.pgd_offset),
+						sizeof(cur_pgd_va));
+				}
+				kfunc(mmput)(mm);
+				if (cur_pgd_va) {
+					uint64_t cur_pgd_pa = pgt_virt_to_phys(cur_pgd_va);
+					asm volatile("msr ttbr0_el1, %0\n isb\n" :: "r"(cur_pgd_pa) : "memory");
+				}
+			}
+		}
+	}
+
+	return old_ttbr0;
+}
+
+static inline void hmkpm_uaccess_disable(uint64_t old_ttbr0)
+{
+	if (unlikely(sw_pan_enabled)) {
+		uint64_t restore_val = reserved_ttbr0_val ? reserved_ttbr0_val : old_ttbr0;
+		if (restore_val) {
+			asm volatile("msr ttbr0_el1, %0\n isb\n" :: "r"(restore_val) : "memory");
+		}
+	}
+}
+
+static inline unsigned long hmkpm_copy_to_user(void __user *to, const void *from, unsigned long n)
+{
+	uint64_t flags = hmkpm_uaccess_enable();
+	unsigned long ret = kfunc(__arch_copy_to_user)(to, from, n);
+	hmkpm_uaccess_disable(flags);
+	return ret;
+}
+
+static inline unsigned long hmkpm_copy_from_user(void *to, const void __user *from, unsigned long n)
+{
+	uint64_t flags = hmkpm_uaccess_enable();
+	unsigned long ret = kfunc(__arch_copy_from_user)(to, from, n);
+	hmkpm_uaccess_disable(flags);
+	return ret;
 }
 
 static inline int validate_virt_range(uint64_t va, uint64_t size)
@@ -274,10 +378,10 @@ static uint64_t pgt_pgtable_to_tkpa(uint64_t pgd, uint64_t va)
 	if (!pgd)
 		return 0;
 
-	if (pgd & (pgt_page_size - 1))
+	if (pgd & pgt_pgd_align_mask)
 		return 0;
 
-	if (validate_virt_range(pgd, pgt_page_size))
+	if (validate_virt_range(pgd, pgt_pgd_size))
 		return 0;
 
 	va = pgt_untag_user_va(va);
@@ -470,10 +574,42 @@ static int pgt_pgtable_init(void)
 
 	pgt_page_size = 1ULL << pgt_page_shift;
 
-	if (kver >= VERSION(5, 4, 0)) {
-		pgt_page_offset = (-(UL(1) << (va1_bits)));
+	/*
+	 * Root page table (PGD) size and alignment calculation:
+	 * In 4-level paging (48-bit VA, 4KB page) PGD is 512 entries = 4096 bytes (4KB aligned).
+	 * In 3-level paging with reduced VA (e.g. 36-bit VA on older kernels),
+	 * PGD has only (1 << (36 - 30)) = 64 entries = 512 bytes, so required alignment is 512 bytes.
+	 */
+	int64_t root_lv = 4 - (int64_t)pgt_page_level;
+	uint64_t root_shift = (pgt_page_shift - 3) * (4 - root_lv) + 3;
+
+	if (pgt_va_bits > root_shift) {
+		uint64_t root_bits = pgt_va_bits - root_shift;
+		pgt_pgd_size = (1ULL << root_bits) * 8;
+		if (pgt_pgd_size < pgt_page_size) {
+			/* Table is smaller than a page; align to table size (minimum 64 bytes) */
+			pgt_pgd_align_mask = pgt_pgd_size - 1;
+		} else {
+			pgt_pgd_size = pgt_page_size;
+			pgt_pgd_align_mask = pgt_page_size - 1;
+		}
 	} else {
-		pgt_page_offset = (UL(0xffffffffffffffff) - (UL(1) << (va1_bits - 1)) + 1);
+		pgt_pgd_size = pgt_page_size;
+		pgt_pgd_align_mask = pgt_page_size - 1;
+	}
+
+	/* In kernels >= 5.4.0, ARM64 standardizes full page alignment for PGD */
+	if (kver >= VERSION(5, 4, 0)) {
+		pgt_pgd_size = pgt_page_size;
+		pgt_pgd_align_mask = pgt_page_size - 1;
+	}
+
+	if (kver >= VERSION(5, 4, 0)) {
+		pgt_page_offset = -(UL(1) << va1_bits);
+	} else if (kver >= VERSION(4, 6, 0)) {
+		pgt_page_offset = -(UL(1) << (va1_bits - 1));
+	} else {
+		pgt_page_offset = -(UL(1) << va1_bits);
 	}
 
 	hkvar_match(memstart_addr);
@@ -486,10 +622,10 @@ static int pgt_pgtable_init(void)
 
 	pgt_tbi0 = !!(tcr_el1 & (1ULL << 37));
 
-	hmkpm_info("Page table config: va0_bits=%llu, shift=%llu, size=0x%llx, level=%llu, tbi0=%d\n",
-		   va0_bits, pgt_page_shift, pgt_page_size, pgt_page_level, pgt_tbi0);
-	hmkpm_info("phys_offset=0x%llx, page_offset=0x%llx, linear_voffset=0x%llx\n",
-		   pgt_phys_offset, pgt_page_offset, pgt_linear_voffset);
+	hmkpm_info("Page table config: va0_bits=%llu, shift=%llu, size=0x%llx, pgd_size=0x%llx, level=%llu, tbi0=%d\n",
+		   va0_bits, pgt_page_shift, pgt_page_size, pgt_pgd_size, pgt_page_level, pgt_tbi0);
+	hmkpm_info("phys_offset=0x%llx, page_offset=0x%llx, linear_voffset=0x%llx, pgd_align_mask=0x%llx\n",
+		   pgt_phys_offset, pgt_page_offset, pgt_linear_voffset, pgt_pgd_align_mask);
 
 	return 0;
 }
@@ -544,7 +680,7 @@ static void hmkpm_zero_user(void __user *dst, size_t size)
 	while (size > 0) {
 		size_t chunk = min(size, sizeof(zero_chunk));
 
-		if (kfunc(__arch_copy_to_user)(dst, zero_chunk, chunk) != 0)
+		if (hmkpm_copy_to_user(dst, zero_chunk, chunk) != 0)
 			break;
 		dst = (void __user *)((uintptr_t)dst + chunk);
 		size -= chunk;
@@ -587,11 +723,11 @@ static ssize_t pgt_rw_mm(struct mm_struct *mm, uint64_t remote_va, size_t len, v
 		tkva = (void *)pgt_phys_to_virt(tkpa);
 
 		if (!is_write) {
-			/* __arch_copy_to_user returns number of bytes NOT copied (0=success) */
-			not_copied = kfunc(__arch_copy_to_user)(local_buf, tkva, chunk);
+			/* hmkpm_copy_to_user returns number of bytes NOT copied (0=success) */
+			not_copied = hmkpm_copy_to_user(local_buf, tkva, chunk);
 		} else {
-			/* __arch_copy_from_user returns number of bytes NOT copied (0=success) */
-			not_copied = kfunc(__arch_copy_from_user)(tkva, local_buf, chunk);
+			/* hmkpm_copy_from_user returns number of bytes NOT copied (0=success) */
+			not_copied = hmkpm_copy_from_user(tkva, local_buf, chunk);
 		}
 
 		copied = chunk - not_copied;
@@ -653,7 +789,7 @@ static void hmkpm_handle_single(hook_fargs3_t *args, void __user *user_ptr, uint
 		return;
 	}
 
-	if (kfunc(__arch_copy_from_user)(&req, user_ptr, HMKPM_REQ_SIZE) != 0) {
+	if (hmkpm_copy_from_user(&req, user_ptr, HMKPM_REQ_SIZE) != 0) {
 		args->ret = (uint64_t)(long)-EFAULT;
 		return;
 	}
@@ -718,7 +854,7 @@ static void hmkpm_handle_batch(hook_fargs3_t *args, void __user *user_ptr, uint6
 		goto out;
 	}
 
-	if (kfunc(__arch_copy_from_user)(&hdr, user_ptr, HMKPM_BATCH_HDR_SIZE) != 0) {
+	if (hmkpm_copy_from_user(&hdr, user_ptr, HMKPM_BATCH_HDR_SIZE) != 0) {
 		rc = -EFAULT;
 		goto out;
 	}
@@ -819,7 +955,7 @@ static void hmkpm_handle_batch(hook_fargs3_t *args, void __user *user_ptr, uint6
 					    HMKPM_BATCH_HDR_SIZE +
 					    (uint64_t)done * HMKPM_BATCH_ENTRY_SIZE);
 
-		if (kfunc(__arch_copy_from_user)((void *)chunk, entry_src, chunk_bytes) != 0) {
+		if (hmkpm_copy_from_user((void *)chunk, entry_src, chunk_bytes) != 0) {
 			rc = -EFAULT;
 			goto out_mm;
 		}
@@ -877,7 +1013,7 @@ static void hmkpm_handle_batch(hook_fargs3_t *args, void __user *user_ptr, uint6
 		}
 
 		/* Return chunk with actual transferred sizes of each entry to userspace */
-		if (kfunc(__arch_copy_to_user)(entry_src, chunk, chunk_bytes) != 0) {
+		if (hmkpm_copy_to_user(entry_src, chunk, chunk_bytes) != 0) {
 			rc = -EFAULT;
 			goto out_mm;
 		}
@@ -1058,50 +1194,57 @@ static inline bool is_ret_insn(u32 insn)
 }
 
 /*
- * Branches that end the basic block or redirect control flow.
- *
- * Includes:
- *   B/BL
- *   B.cond
- *   CBZ/CBNZ
- *   TBZ/TBNZ
- *   BR/BLR/RET/ERET
+ * Instructions that definitively exit or leave the function / subroutine.
+ * Local conditional branches (B.cond, CBZ, CBNZ, TBZ, TBNZ) are NOT function exits.
  */
-static bool insn_is_control_transfer(u32 insn)
+static bool insn_is_function_exit(u32 insn)
 {
-	u32 op = insn & 0xfc000000;
-
-	/* B / BL */
-	if (op == 0x14000000 || op == 0x94000000)
-		return true;
-
 	/* RET */
 	if (is_ret_insn(insn))
-		return true;
-
-	/* BR */
-	if ((insn & 0xfffffc1f) == 0xd61f0000)
-		return true;
-
-	/* BLR */
-	if ((insn & 0xfffffc1f) == 0xd63f0000)
 		return true;
 
 	/* ERET */
 	if (insn == 0xd69f03e0)
 		return true;
 
-	/* B.cond */
-	if ((insn & 0xff000010) == 0x54000000)
+	/* Indirect branch (BR) */
+	if ((insn & 0xfffffc1f) == 0xd61f0000)
 		return true;
 
-	/* CBZ/CBNZ */
-	if ((insn & 0x7e000000) == 0x34000000)
-		return true;
+	return false;
+}
 
-	/* TBZ/TBNZ */
-	if ((insn & 0x7e000000) == 0x36000000)
-		return true;
+/*
+ * Recognizes 64-bit atomic operations commonly used in inlined rwsem fast paths:
+ * 1. LSE Atomics (ARMv8.1+): CAS, CASAL, CASA, CASL, LDADD, SWP, LDCLR, LDSET, LDEOR
+ * 2. LL/SC (ARMv8.0): LDAXR, LDXR, STLXR, STXR
+ */
+static bool insn_is_atomic_rwsem_op(u32 insn, unsigned int *rn)
+{
+	/* 1. 64-bit CAS / CASAL / CASA / CASL (LSE Atomics) */
+	if ((insn & 0xffa08000) == 0xc8a00000) {
+		*rn = a64_insn_rn(insn);
+		return (*rn != 31);
+	}
+
+	/* 2. 64-bit LDADD, SWP, LDCLR, LDSET, LDEOR (LSE Atomics) */
+	if ((insn & 0xff00fc00) == 0xf8000000) {
+		*rn = a64_insn_rn(insn);
+		return (*rn != 31);
+	}
+
+	/* 3. 64-bit LDAXR / LDXR (LL/SC Load-Exclusive) */
+	if ((insn & 0xffe07c00) == 0xc85f7c00) {
+		*rn = a64_insn_rn(insn);
+		return (*rn != 31);
+	}
+
+	/* 4. 64-bit STLXR / STXR (LL/SC Store-Exclusive) */
+	if ((insn & 0xffe07c00) == 0xc8007c00 ||
+	    (insn & 0xffe07c00) == 0xc800fc00) {
+		*rn = a64_insn_rn(insn);
+		return (*rn != 31);
+	}
 
 	return false;
 }
@@ -1261,7 +1404,7 @@ static bool insn_wide_imm(u32 insn, unsigned int *rd, unsigned int *hw,
 	return true;
 }
 
-#define MAX_PROBE_FUNCS           16
+#define MAX_PROBE_FUNCS           32
 #define MAX_PROBE_VOTES           64
 #define MAX_SCAN_INSNS            4096UL
 #define BACK_SCAN_MAX             32
@@ -1277,8 +1420,8 @@ struct offset_vote {
 static struct offset_vote probe_votes[MAX_PROBE_VOTES];
 static int nr_probe_votes;
 
-/* Expanded list covering kernels 4.14 through 6.x+ */
-static const char *const probe_func_names[MAX_PROBE_FUNCS] = {
+/* Expanded list covering kernels 4.14 through 6.x+ and vendor inlines */
+static const char *const probe_func_names[] = {
 	"vm_munmap",
 	"__vm_munmap",
 	"vm_brk_flags",
@@ -1294,24 +1437,54 @@ static const char *const probe_func_names[MAX_PROBE_FUNCS] = {
 	"sys_munmap",
 	"do_mmap",
 	"mmap_region",
+	"dup_mmap",
+	"copy_process",
+	"sys_mmap_pgoff",
+	"use_mm",
+	"unuse_mm",
+	"__vma_link_rb",
+	"vma_adjust",
+	"find_vma",
+	"mmput",
 };
 #define NR_PROBE_FUNCS (sizeof(probe_func_names) / sizeof(probe_func_names[0]))
 
 static const char *const lock_symbol_names[] = {
 	"down_read",
+	"_down_read",
+	"__down_read",
 	"down_write",
+	"_down_write",
+	"__down_write",
 	"up_read",
+	"_up_read",
+	"__up_read",
 	"up_write",
+	"_up_write",
+	"__up_write",
 	"down_read_killable",
 	"down_write_killable",
 	"down_read_trylock",
+	"_down_read_trylock",
+	"__down_read_trylock",
 	"down_write_trylock",
 	"rwsem_down_read",
 	"rwsem_down_write",
 	"rwsem_down_read_failed",
+	"__rwsem_down_read_failed",
 	"rwsem_down_write_failed",
+	"__rwsem_down_write_failed",
+	"rwsem_down_write_failed_killable",
+	"__rwsem_down_write_failed_killable",
 	"rwsem_down_read_slow",
 	"rwsem_down_write_slow",
+	"__rwsem_down_read_slowpath",
+	"__rwsem_down_write_slowpath",
+	"rwsem_optimistic_spin",
+	"rwsem_spin_on_owner",
+	"rwsem_wake",
+	"__rwsem_wake",
+	"__rwsem_up_read_failed",
 	"rwsem_up_read",
 	"rwsem_up_write",
 };
@@ -1423,28 +1596,25 @@ static void add_probe_vote(unsigned int offset, int func_idx)
 }
 
 /*
- * Backward scan from call site.
- *
- * We start by expecting x0 to contain the lock address:
- *   x0 = mm + offset
- *
- * Supported patterns:
- *   add x0, xbase, #offset
- *   add x19, xbase, #offset; mov x0, x19
- *   movz/movk wN, #offset; add x0, xbase, wN, uxtw
- *   movz/movk xN, #offset; add x0, xbase, xN
- *   add x0, xbase, xN, lsl #shift
+ * Backward scan from call site or atomic instruction site.
+ * Tracks the register start_reg backwards looking for:
+ *   add start_reg, xbase, #offset
+ *   movz/movk/add combinations
  */
-static int find_offset_before_branch(unsigned long branch_pc,
+static int find_offset_before_pc_reg(unsigned long start_pc,
+				     unsigned int start_reg,
 				     unsigned int *offset)
 {
 	int i;
-	int need_reg = 0; /* Start by tracking X0 (1st argument) */
+	int need_reg = (int)start_reg;
 	enum need_kind need_kind = NEED_ADDR;
 	unsigned int need_shift = 0;
 	bool have_partial = false;
 	u64 partial_val = 0;
 	u64 partial_mask = 0;
+
+	if (need_reg < 0 || need_reg >= 31)
+		return -EINVAL;
 
 	for (i = 1; i <= BACK_SCAN_MAX; i++) {
 		unsigned long pc;
@@ -1457,18 +1627,18 @@ static int find_offset_before_branch(unsigned long branch_pc,
 		enum wide_imm_op wtype;
 
 		/* Check underflow before computing pc. */
-		if ((unsigned long)i * 4 > branch_pc)
+		if ((unsigned long)i * 4 > start_pc)
 			break;
 
-		pc = branch_pc - (unsigned long)i * 4;
+		pc = start_pc - (unsigned long)i * 4;
 
 		if (hmkpm_copy_from_kernel_nofault(&insn,
 						   (const void *)pc,
 						   sizeof(insn)) != 0)
 			break;
 
-		/* Any branch/return means exiting the basic block. */
-		if (insn_is_control_transfer(insn))
+		/* Hard function returns / exits end the search */
+		if (insn_is_function_exit(insn))
 			break;
 
 		/* 1. MOV register forwarding (ORR Xd, XZR, Xm or ADD Xd, Xm, #0) */
@@ -1500,7 +1670,7 @@ static int find_offset_before_branch(unsigned long branch_pc,
 
 				/*
 				 * If searching for the final address:
-				 *   ADD X0, Xbase, #offset
+				 *   ADD Xn, Xbase, #offset
 				 */
 				if (need_kind == NEED_ADDR &&
 				    rn != 31 &&
@@ -1619,6 +1789,7 @@ static void scan_function_for_lock_offset(unsigned long func,
 		u32 insn;
 		unsigned long target;
 		unsigned long resolved_target;
+		unsigned int atomic_rn = 0;
 		int j;
 
 		if (hmkpm_copy_from_kernel_nofault(&insn,
@@ -1626,6 +1797,21 @@ static void scan_function_for_lock_offset(unsigned long func,
 						   sizeof(insn)) != 0)
 			break;
 
+		/*
+		 * Strategy 1: Direct inlined atomic instruction (LSE atomics or LL/SC)
+		 * Operating directly on struct mm_struct + offset
+		 */
+		if (insn_is_atomic_rwsem_op(insn, &atomic_rn)) {
+			unsigned int off = 0;
+			if (find_offset_before_pc_reg(pc, atomic_rn, &off) == 0) {
+				add_probe_vote(off, func_idx);
+			}
+			continue;
+		}
+
+		/*
+		 * Strategy 2: Branch to lock function or slowpath helper
+		 */
 		if (!insn_is_bl_or_b(pc, insn, &target))
 			continue;
 
@@ -1642,7 +1828,7 @@ static void scan_function_for_lock_offset(unsigned long func,
 			    (lock_resolved[j] &&
 			     (target == lock_resolved[j] ||
 			      resolved_target == lock_resolved[j]))) {
-				if (find_offset_before_branch(pc, &off) == 0)
+				if (find_offset_before_pc_reg(pc, 0, &off) == 0)
 					add_probe_vote(off, func_idx);
 				break;
 			}
@@ -1833,7 +2019,7 @@ static inline int get_mm_mmap_lock_offset(void)
 		if (find_mm_mmap_sem_offset(&off) == 0)
 			return (int)off;
 
-		return -ENOENT;
+		return -1;
 	}
 }
 
@@ -1879,8 +2065,19 @@ static long module_init_handler(const char *args, const char *event, void *__use
 	hkfunc_match(mmput);
 	hkfunc_match(__rcu_read_lock);
 	hkfunc_match(__rcu_read_unlock);
-	hkfunc_match(down_read);
-	hkfunc_match(up_read);
+
+	/* Optional lock routines (may be inlined in vendor kernels) */
+	kf_down_read = (typeof(kf_down_read))hmkpm_lookup_symbol("down_read");
+	if (!kf_down_read)
+		kf_down_read = (typeof(kf_down_read))hmkpm_lookup_symbol("_down_read");
+	if (!kf_down_read)
+		kf_down_read = (typeof(kf_down_read))hmkpm_lookup_symbol("__down_read");
+
+	kf_up_read = (typeof(kf_up_read))hmkpm_lookup_symbol("up_read");
+	if (!kf_up_read)
+		kf_up_read = (typeof(kf_up_read))hmkpm_lookup_symbol("_up_read");
+	if (!kf_up_read)
+		kf_up_read = (typeof(kf_up_read))hmkpm_lookup_symbol("__up_read");
 
 	hkvar_match(high_memory);
 	if (!kv_high_memory) {
@@ -1907,12 +2104,12 @@ static long module_init_handler(const char *args, const char *event, void *__use
 	}
 
 	mmap_lock_sem_offset = get_mm_mmap_lock_offset();
-	if (mmap_lock_sem_offset >= 0) {
+	if (mmap_lock_sem_offset >= 0 && kf_down_read && kf_up_read) {
 		hmkpm_info("mmap lock/sem offset = %d (0x%x)\n",
 			   mmap_lock_sem_offset, mmap_lock_sem_offset);
 	} else {
-		hmkpm_error("Failed to determine mmap lock/sem offset, aborting...\n");
-		return -ENOENT;
+		hmkpm_warn("mmap lock/sem offset not resolved; running in lockless mode\n");
+		mmap_lock_sem_offset = -1;
 	}
 
 	if (init_error) {
