@@ -1,4 +1,3 @@
-
 ifndef KP_DIR
 	KP_DIR = KPM-Headers
 endif
@@ -10,7 +9,8 @@ endif
 CC = $(TARGET_COMPILE)gcc
 LD = $(TARGET_COMPILE)ld
 
-CFLAGS += -fno-builtin-memset -fno-builtin -mgeneral-regs-only
+CFLAGS += -Wall -O2 -std=gnu11 -fno-builtin -fno-builtin-memset -fno-pic -fno-PIC -fno-pie -fno-PIE -fno-asynchronous-unwind-tables -fno-unwind-tables
+CFLAGS += -fno-stack-protector -fno-common -mgeneral-regs-only -mcmodel=small
 
 INCLUDE_DIRS := . include patch/include linux/include linux/arch/arm64/include linux/tools/arch/arm64/include
 
@@ -21,10 +21,10 @@ objs := hmkpm.o
 all: hmkpm.kpm
 
 hmkpm.kpm: ${objs}
-	${CC} -r -o $@ $^
+	${LD} -r -o $@ $^
 
 %.o: %.c
-	${CC} $(CFLAGS) $(INCLUDE_FLAGS) -c -O2 -o $@ $<
+	${CC} $(CFLAGS) $(INCLUDE_FLAGS) -c -o $@ $<
 
 .PHONY: clean
 clean:

@@ -9,6 +9,7 @@
 #include <common.h>
 #include <compiler.h>
 #include <hook.h>
+#include <kconfig.h>
 #include <kpmodule.h>
 #include <kputils.h>
 #include <ksyms.h>
@@ -23,7 +24,7 @@
 #include <uapi/asm-generic/unistd.h>
 
 KPM_NAME("HMKPM");
-KPM_VERSION("2.3.4");
+KPM_VERSION("2.4.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Yervant7");
 KPM_DESCRIPTION("A KernelPatch Module (KPM) HMKPM");
@@ -34,7 +35,6 @@ static int mmap_lock_sem_offset = -1;
 
 struct rw_semaphore;
 extern bool is_su_allow_uid(uid_t uid);
-extern int kp_kconfig_enabled(const char *name) __attribute__((weak));
 
 #define U64_MAX				((u64)~0ULL)
 #define HMKPM_TAG			"[HMKPM] "
@@ -174,7 +174,7 @@ static inline long hmkpm_copy_from_kernel_nofault(void *dst, const void *src, si
 	return -ENOSYS;
 }
 
-static inline long hmkpm_copy_to_kernel_nofault(void *dst, const void *src, size_t size)
+static inline long __maybe_unused hmkpm_copy_to_kernel_nofault(void *dst, const void *src, size_t size)
 {
 	kfunc_call(copy_to_kernel_nofault, dst, src, size);
 	kfunc_call(probe_kernel_write, dst, src, size);
@@ -218,10 +218,8 @@ static void hmkpm_check_sw_pan_lazy(void)
 	if (likely(sw_pan_checked))
 		return;
 
-	/* 1. Check via kp_kconfig_enabled (lazy check after boot completed) */
-	if (kp_kconfig_enabled && kp_kconfig_enabled("CONFIG_ARM64_SW_TTBR0_PAN")) {
+	if (kp_kconfig_enabled("CONFIG_ARM64_SW_TTBR0_PAN"))
 		sw_pan_enabled = true;
-	}
 
 	/* 2. Check if reserved_ttbr0 symbol exists in kernel */
 	unsigned long sym_reserved = hmkpm_lookup_symbol("reserved_ttbr0");
@@ -1595,7 +1593,7 @@ static bool insn_may_write_reg(u32 insn, unsigned int reg)
 		return false;
 
 	/* STP (64-bit store pair) -> reg in [4:0] is only stored data */
-	if ((insn & 0xfe400000) == 0xa9000000)
+	if ((insn & 0xfe400000) == 0xa8000000)
 		return false;
 
 	/* Generic load/store: if bit 22 is 0, it is a store */
