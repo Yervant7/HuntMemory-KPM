@@ -21,7 +21,7 @@
 #include <uapi/asm-generic/unistd.h>
 
 KPM_NAME("HMKPM");
-KPM_VERSION("2.1.0");
+KPM_VERSION("2.2.0");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Yervant7");
 KPM_DESCRIPTION("A KernelPatch Module (KPM) HMKPM");
@@ -39,7 +39,36 @@ extern bool is_su_allow_uid(uid_t uid);
 #define hmkpm_info(fmt, ...)		logki(HMKPM_TAG fmt, ##__VA_ARGS__)
 #define hmkpm_error(fmt, ...)		logke(HMKPM_TAG fmt, ##__VA_ARGS__)
 
-static unsigned long hmkpm_lookup_symbol(const char *name);
+static inline void make_cfi_name(char *dst, size_t dst_size, const char *name)
+{
+	const char *suffix = ".cfi_jt";
+	size_t i = 0;
+
+	while (name && *name && i + 1 < dst_size)
+		dst[i++] = *name++;
+
+	while (*suffix && i + 1 < dst_size)
+		dst[i++] = *suffix++;
+
+	dst[i] = '\0';
+}
+
+static unsigned long hmkpm_lookup_symbol(const char *name)
+{
+	unsigned long addr;
+
+	if (!name || !kallsyms_lookup_name)
+		return 0;
+
+	addr = kallsyms_lookup_name(name);
+	if (!addr) {
+		char cfi_name[64];
+
+		make_cfi_name(cfi_name, sizeof(cfi_name), name);
+		addr = kallsyms_lookup_name(cfi_name);
+	}
+	return addr;
+}
 
 #define hkfunc_match(func)							\
 do {										\
@@ -281,8 +310,7 @@ static uint64_t pgt_pgtable_to_tkpa(uint64_t pgd, uint64_t va)
 
 		/*
 		 * At the starting level, the table may not use all indices.
-		 * This prevents accepting non-canonical VA with index outside the real
-		 * range.
+		 * This prevents accepting non-canonical VA with index outside the real range.
 		 */
 		top_bits = pgt_va_bits - pxd_shift;
 
@@ -829,8 +857,7 @@ static void hmkpm_handle_batch(hook_fargs3_t *args, void __user *user_ptr, uint6
 
 			ret = pgt_rw_mm(mm, e->addr, req_size, data_ptr, write_op);
 			if (ret < 0) {
-				/* Page walk / copy failed: mark size = 0 so userspace identifies the
-				 * failed address */
+				/* Page walk / copy failed: mark size = 0 so userspace identifies the failed address */
 				e->size = 0;
 				if (!write_op)
 					hmkpm_zero_user(data_ptr, req_size);
@@ -845,8 +872,7 @@ static void hmkpm_handle_batch(hook_fargs3_t *args, void __user *user_ptr, uint6
 				e->size = req_size;
 			}
 
-			/* Always advance by the requested size to maintain strict buffer
-			 * alignment */
+			/* Always advance by the requested size to maintain strict buffer alignment */
 			data_off += req_size;
 		}
 
@@ -925,6 +951,34 @@ static void hmkpm_handle(hook_fargs3_t *args, void *udata)
 	args->ret = (uint64_t)(long)-EINVAL;
 }
 
+/* ========================================================================
+ * Dynamic ARM64 Disassembly & mmap_sem Probe Scanner
+ * ======================================================================== */
+
+static inline unsigned int a64_insn_rd(u32 insn)
+{
+	return insn & 0x1f;
+}
+
+static inline unsigned int a64_insn_rn(u32 insn)
+{
+	return (insn >> 5) & 0x1f;
+}
+
+static inline unsigned int a64_insn_rm(u32 insn)
+{
+	return (insn >> 16) & 0x1f;
+}
+
+/*
+ * NOP, BTI and various hint/PAC instructions reside in HINT space.
+ * They may appear at the start of functions/trampolines in modern kernels.
+ */
+static inline bool insn_is_prologue_hint(u32 insn)
+{
+	return (insn & 0xfffff000) == 0xd5032000;
+}
+
 static bool insn_is_bl_or_b(unsigned long pc, u32 insn, unsigned long *target)
 {
 	u32 op = insn & 0xfc000000;
@@ -946,31 +1000,56 @@ static bool insn_is_bl_or_b(unsigned long pc, u32 insn, unsigned long *target)
 	return true;
 }
 
+/*
+ * Follows trampolines of the form:
+ *
+ *   target:
+ *       b real_target
+ *
+ * or on kernels with BTI/PAC:
+ *
+ *   target:
+ *       bti c
+ *       b real_target
+ *
+ * If no B instruction is found after prologue hints, returns the target itself.
+ */
 static unsigned long resolve_branch_target(unsigned long target)
 {
-	u32 target_insn;
-	unsigned long next_target;
+	unsigned long resolved = target;
 	int hops = 0;
 
-	while (target && hops++ < 4) {
-		if (hmkpm_copy_from_kernel_nofault((void *)&target_insn,
-						   (const void *)target,
-						   sizeof(target_insn)) != 0)
-			break;
+	while (resolved && hops++ < 4) {
+		unsigned long cursor = resolved;
+		bool found_b = false;
+		int skip;
 
-		/*
-		 * If destination is an unconditional branch B <imm26>, follow the branch
-		 * (trampoline / CFI / PLT)
-		 */
-		if ((target_insn & 0xfc000000) == 0x14000000) {
-			if (insn_is_bl_or_b(target, target_insn, &next_target)) {
-				target = next_target;
+		for (skip = 0; skip < 3; skip++, cursor += 4) {
+			u32 insn;
+			unsigned long next;
+
+			if (hmkpm_copy_from_kernel_nofault(&insn,
+							   (const void *)cursor,
+							   sizeof(insn)) != 0)
+				break;
+
+			if (insn_is_prologue_hint(insn))
 				continue;
+
+			/* Only unconditional B; BL is not a normal trampoline. */
+			if ((insn & 0xfc000000) == 0x14000000 &&
+			    insn_is_bl_or_b(cursor, insn, &next)) {
+				resolved = next;
+				found_b = true;
 			}
+			break;
 		}
-		break;
+
+		if (!found_b)
+			break;
 	}
-	return target;
+
+	return resolved;
 }
 
 static inline bool is_ret_insn(u32 insn)
@@ -978,14 +1057,71 @@ static inline bool is_ret_insn(u32 insn)
 	return (insn & 0xfffffc1f) == 0xd65f0000;
 }
 
-static bool insn_add_imm(u32 insn, unsigned int *rd, unsigned int *rn, unsigned long *imm)
+/*
+ * Branches that end the basic block or redirect control flow.
+ *
+ * Includes:
+ *   B/BL
+ *   B.cond
+ *   CBZ/CBNZ
+ *   TBZ/TBNZ
+ *   BR/BLR/RET/ERET
+ */
+static bool insn_is_control_transfer(u32 insn)
 {
-	/* ADD Xd, Xn, #imm{, LSL #12} 64-bit */
-	if ((insn & 0xff800000) != 0x91000000)
+	u32 op = insn & 0xfc000000;
+
+	/* B / BL */
+	if (op == 0x14000000 || op == 0x94000000)
+		return true;
+
+	/* RET */
+	if (is_ret_insn(insn))
+		return true;
+
+	/* BR */
+	if ((insn & 0xfffffc1f) == 0xd61f0000)
+		return true;
+
+	/* BLR */
+	if ((insn & 0xfffffc1f) == 0xd63f0000)
+		return true;
+
+	/* ERET */
+	if (insn == 0xd69f03e0)
+		return true;
+
+	/* B.cond */
+	if ((insn & 0xff000010) == 0x54000000)
+		return true;
+
+	/* CBZ/CBNZ */
+	if ((insn & 0x7e000000) == 0x34000000)
+		return true;
+
+	/* TBZ/TBNZ */
+	if ((insn & 0x7e000000) == 0x36000000)
+		return true;
+
+	return false;
+}
+
+/*
+ * ADD/ADDS immediate 64-bit:
+ *
+ *   ADD  Xd, Xn, #imm{, LSL #12}
+ *   ADDS Xd, Xn, #imm{, LSL #12}
+ */
+static bool insn_add_imm(u32 insn, unsigned int *rd, unsigned int *rn,
+			 unsigned long *imm)
+{
+	u32 op = insn & 0xff800000;
+
+	if (op != 0x91000000 && op != 0xb1000000)
 		return false;
 
-	*rd = insn & 0x1f;
-	*rn = (insn >> 5) & 0x1f;
+	*rd = a64_insn_rd(insn);
+	*rn = a64_insn_rn(insn);
 	*imm = (insn >> 10) & 0xfff;
 
 	/* Shift bit 22: LSL #12 */
@@ -995,120 +1131,276 @@ static bool insn_add_imm(u32 insn, unsigned int *rd, unsigned int *rn, unsigned 
 	return true;
 }
 
-static inline void make_cfi_name(char *dst, size_t dst_size, const char *name)
+/*
+ * MOV register:
+ *
+ *   MOV Xd, Xm  == ORR Xd, XZR, Xm  or  ADD Xd, Xm, #0
+ *   MOV Wd, Wm  == ORR Wd, WZR, Wm  or  ADD Wd, Wm, #0
+ */
+static bool insn_is_mov_reg(u32 insn, unsigned int *rd, unsigned int *rm,
+			    bool *is64)
 {
-	const char *suffix = ".cfi_jt";
-	size_t i = 0;
-
-	while (name && *name && i + 1 < dst_size)
-		dst[i++] = *name++;
-
-	while (*suffix && i + 1 < dst_size)
-		dst[i++] = *suffix++;
-
-	dst[i] = '\0';
-}
-
-static unsigned long hmkpm_lookup_symbol(const char *name)
-{
-	unsigned long addr;
-
-	if (!name || !kallsyms_lookup_name)
-		return 0;
-
-	addr = kallsyms_lookup_name(name);
-	if (!addr) {
-		char cfi_name[64];
-
-		make_cfi_name(cfi_name, sizeof(cfi_name), name);
-		addr = kallsyms_lookup_name(cfi_name);
+	/* ORR Xd, XZR, Xm, LSL #0 */
+	if ((insn & 0xffe0ffe0) == 0xaa0003e0) {
+		*rd = a64_insn_rd(insn);
+		*rm = a64_insn_rm(insn);
+		*is64 = true;
+		return true;
 	}
-	return addr;
+
+	/* ORR Wd, WZR, Wm */
+	if ((insn & 0xffe0ffe0) == 0x2a0003e0) {
+		*rd = a64_insn_rd(insn);
+		*rm = a64_insn_rm(insn);
+		*is64 = false;
+		return true;
+	}
+
+	/* ADD Xd, Xm, #0 */
+	if ((insn & 0xffe003e0) == 0x91000000) {
+		*rd = a64_insn_rd(insn);
+		*rm = a64_insn_rn(insn);
+		*is64 = true;
+		return true;
+	}
+
+	/* ADD Wd, Wm, #0 */
+	if ((insn & 0xffe003e0) == 0x11000000) {
+		*rd = a64_insn_rd(insn);
+		*rm = a64_insn_rn(insn);
+		*is64 = false;
+		return true;
+	}
+
+	return false;
 }
 
-#define MAX_PROBE_FUNCS			8
-#define MAX_PROBE_VOTES			64
-#define MAX_SCAN_INSNS			2048UL
-#define BACK_SCAN_MAX			8
-#define OFFSET_MIN			8U
-#define OFFSET_MAX			4096U
+/*
+ * ADD/ADDS shifted/extended register 64-bit.
+ *
+ * Examples:
+ *
+ *   ADD Xd, Xn, Xm
+ *   ADD Xd, Xn, Xm, LSL #n
+ *   ADD Xd, Xn, Wm, UXTW
+ *   ADD Xd, Xn, Wm, UXTW #n
+ */
+static bool insn_is_add_reg(u32 insn, unsigned int *rd, unsigned int *rn,
+			    unsigned int *rm, bool *extended,
+			    unsigned int *shift)
+{
+	/* ADD/ADDS shifted register, LSL only */
+	if ((insn & 0xffe00000) == 0x8b000000 ||
+	    (insn & 0xffe00000) == 0xab000000) {
+		*rd = a64_insn_rd(insn);
+		*rn = a64_insn_rn(insn);
+		*rm = a64_insn_rm(insn);
+		*extended = false;
+		*shift = (insn >> 10) & 0x3f;
+		return true;
+	}
+
+	/* ADD/ADDS extended register */
+	if ((insn & 0xffe00000) == 0x8b200000 ||
+	    (insn & 0xffe00000) == 0xab200000) {
+		*rd = a64_insn_rd(insn);
+		*rn = a64_insn_rn(insn);
+		*rm = a64_insn_rm(insn);
+		*extended = true;
+		*shift = (insn >> 10) & 0x7;
+		return true;
+	}
+
+	return false;
+}
+
+enum need_kind {
+	NEED_ADDR,
+	NEED_CONST,
+};
+
+enum wide_imm_op {
+	WIDE_MOVZ,
+	WIDE_MOVK,
+	WIDE_MOVN,
+};
+
+/*
+ * MOVZ/MOVK/MOVN wide immediate instructions.
+ */
+static bool insn_wide_imm(u32 insn, unsigned int *rd, unsigned int *hw,
+			  unsigned long *imm16, enum wide_imm_op *type)
+{
+	switch (insn & 0xff800000) {
+	case 0xd2800000:
+		*type = WIDE_MOVZ; /* MOVZ X */
+		break;
+	case 0x52800000:
+		*type = WIDE_MOVZ; /* MOVZ W */
+		break;
+	case 0xf2800000:
+		*type = WIDE_MOVK; /* MOVK X */
+		break;
+	case 0x72800000:
+		*type = WIDE_MOVK; /* MOVK W */
+		break;
+	case 0x92800000:
+		*type = WIDE_MOVN; /* MOVN X */
+		break;
+	case 0x12800000:
+		*type = WIDE_MOVN; /* MOVN W */
+		break;
+	default:
+		return false;
+	}
+
+	*rd = a64_insn_rd(insn);
+	*hw = (insn >> 21) & 0x3;
+	*imm16 = (insn >> 5) & 0xffff;
+
+	return true;
+}
+
+#define MAX_PROBE_FUNCS           16
+#define MAX_PROBE_VOTES           64
+#define MAX_SCAN_INSNS            4096UL
+#define BACK_SCAN_MAX             32
+#define OFFSET_MIN                8U
+#define OFFSET_MAX                4096U
 
 struct offset_vote {
 	u32 offset;
 	u32 count;
-	u8 func_mask;
+	u32 func_mask;
 };
 
 static struct offset_vote probe_votes[MAX_PROBE_VOTES];
 static int nr_probe_votes;
 
+/* Expanded list covering kernels 4.14 through 6.x+ */
 static const char *const probe_func_names[MAX_PROBE_FUNCS] = {
-	"vm_munmap", "__vm_munmap", "vm_brk_flags", "exit_mmap",
-	"vm_mmap_pgoff", "do_munmap", "__do_munmap", "ksys_mmap_pgoff",
+	"vm_munmap",
+	"__vm_munmap",
+	"vm_brk_flags",
+	"do_brk_flags",
+	"exit_mmap",
+	"vm_mmap_pgoff",
+	"do_munmap",
+	"__do_munmap",
+	"ksys_mmap_pgoff",
+	"vm_mmap",
+	"apply_mlockall_flags",
+	"setup_arg_pages",
+	"sys_munmap",
+	"do_mmap",
+	"mmap_region",
 };
+#define NR_PROBE_FUNCS (sizeof(probe_func_names) / sizeof(probe_func_names[0]))
 
-struct lock_symbol_def {
-	const char *name;
+static const char *const lock_symbol_names[] = {
+	"down_read",
+	"down_write",
+	"up_read",
+	"up_write",
+	"down_read_killable",
+	"down_write_killable",
+	"down_read_trylock",
+	"down_write_trylock",
+	"rwsem_down_read",
+	"rwsem_down_write",
+	"rwsem_down_read_failed",
+	"rwsem_down_write_failed",
+	"rwsem_down_read_slow",
+	"rwsem_down_write_slow",
+	"rwsem_up_read",
+	"rwsem_up_write",
 };
+#define NR_PROBE_LOCKS (sizeof(lock_symbol_names) / sizeof(lock_symbol_names[0]))
 
-static const struct lock_symbol_def lock_symbol_defs[] = {
-	{"down_read"}, {"down_write"}, {"up_read"},
-	{"up_write"}, {"down_read_killable"}, {"down_write_killable"},
-	{"down_read_trylock"}, {"down_write_trylock"},
-};
-#define NR_PROBE_LOCKS			(sizeof(lock_symbol_defs) / sizeof(lock_symbol_defs[0]))
+_Static_assert(NR_PROBE_FUNCS <= MAX_PROBE_FUNCS,
+	       "MAX_PROBE_FUNCS must be greater than or equal to NR_PROBE_FUNCS");
 
-static int find_offset_before_branch(unsigned long branch_pc, unsigned int *offset)
+static inline bool offset_is_valid(unsigned long imm)
 {
-	int i;
+	return imm >= OFFSET_MIN && imm <= OFFSET_MAX && (imm & 7) == 0;
+}
 
-	for (i = 1; i <= BACK_SCAN_MAX; i++) {
-		unsigned long pc = branch_pc - (unsigned long)i * 4;
-		u32 insn;
-		unsigned int rd, rn;
-		unsigned long imm;
-		u32 op;
+/*
+ * Heuristic: in ADD register, usually one operand is the base mm_struct
+ * and the other is the offset/index.
+ * We prefer choosing a temporary register as "constant" rather than
+ * a callee-saved/frame pointer register, which is usually the base.
+ */
+static inline bool reg_is_likely_base(unsigned int r)
+{
+	return r == 29 || (r >= 19 && r <= 28);
+}
 
-		if (branch_pc < (unsigned long)i * 4)
-			break;
+static int choose_add_register_source(unsigned int rn, unsigned int rm,
+				      bool extended)
+{
+	if (rn == 31 && rm == 31)
+		return -1;
 
-		if (hmkpm_copy_from_kernel_nofault(&insn, (const void *)pc, sizeof(insn)) != 0)
-			break;
+	/*
+	 * In ADD extended, typically:
+	 *   ADD Xd, Xbase, Woffset, UXTW
+	 * so Rm is usually the offset.
+	 */
+	if (extended)
+		return (rm != 31) ? (int)rm : (int)rn;
 
-		op = insn & 0xfc000000;
+	if (rm == 31)
+		return (int)rn;
+	if (rn == 31)
+		return (int)rm;
 
-		/* If there is another branch or return, stop backward scan */
-		if (op == 0x94000000 || op == 0x14000000)
-			break;
+	if (reg_is_likely_base(rn) && !reg_is_likely_base(rm))
+		return (int)rm;
+	if (reg_is_likely_base(rm) && !reg_is_likely_base(rn))
+		return (int)rn;
 
-		if (is_ret_insn(insn))
-			break;
+	/* Common convention: offset in Rm. */
+	return (int)rm;
+}
 
-		if (insn_add_imm(insn, &rd, &rn, &imm)) {
-			/*
-			 * Look for ADD X0, Xn, #imm.
-			 * rn == 31 represents SP (stack), which is not mm->mmap_sem.
-			 */
-			if (rd == 0 && rn != 31 && imm >= OFFSET_MIN && imm <= OFFSET_MAX &&
-			    (imm & 7) == 0) {
-				*offset = (unsigned int)imm;
-				return 0;
-			}
+/*
+ * Returns true if the instruction likely writes to reg.
+ * Prevents scanning past an actual clobber of the tracked register.
+ */
+static bool insn_may_write_reg(u32 insn, unsigned int reg)
+{
+	unsigned int rd = a64_insn_rd(insn);
 
-			/* If X0 was overwritten by another instruction, stop */
-			if (rd == 0)
-				break;
-		}
+	if (reg == 31 || rd != reg)
+		return false;
+
+	/* STR (immediate 64-bit) -> reg in [4:0] is data stored, not destination */
+	if ((insn & 0xffc00000) == 0xf9000000)
+		return false;
+
+	/* STP (64-bit store pair) -> reg in [4:0] is only stored data */
+	if ((insn & 0xfe400000) == 0xa9000000)
+		return false;
+
+	/* Generic load/store: if bit 22 is 0, it is a store */
+	if ((insn & 0x0e000000) == 0x0a000000) {
+		if ((insn & 0x00400000) == 0)
+			return false; /* store */
+		return true; /* load */
 	}
 
-	return -ENOENT;
+	if (insn_is_prologue_hint(insn))
+		return false;
+
+	return true;
 }
 
 static void add_probe_vote(unsigned int offset, int func_idx)
 {
 	int i;
 
-	if (offset < OFFSET_MIN || offset > OFFSET_MAX || (offset & 7) != 0)
+	if (!offset_is_valid(offset))
 		return;
 
 	if (func_idx < 0 || func_idx >= MAX_PROBE_FUNCS)
@@ -1117,7 +1409,7 @@ static void add_probe_vote(unsigned int offset, int func_idx)
 	for (i = 0; i < nr_probe_votes; i++) {
 		if (probe_votes[i].offset == offset) {
 			probe_votes[i].count++;
-			probe_votes[i].func_mask |= (u8)(1U << func_idx);
+			probe_votes[i].func_mask |= (u32)(1U << func_idx);
 			return;
 		}
 	}
@@ -1125,12 +1417,191 @@ static void add_probe_vote(unsigned int offset, int func_idx)
 	if (nr_probe_votes < MAX_PROBE_VOTES) {
 		probe_votes[nr_probe_votes].offset = offset;
 		probe_votes[nr_probe_votes].count = 1;
-		probe_votes[nr_probe_votes].func_mask = (u8)(1U << func_idx);
+		probe_votes[nr_probe_votes].func_mask = (u32)(1U << func_idx);
 		nr_probe_votes++;
 	}
 }
 
-static void scan_function_for_lock_offset(unsigned long func, unsigned long size, int func_idx,
+/*
+ * Backward scan from call site.
+ *
+ * We start by expecting x0 to contain the lock address:
+ *   x0 = mm + offset
+ *
+ * Supported patterns:
+ *   add x0, xbase, #offset
+ *   add x19, xbase, #offset; mov x0, x19
+ *   movz/movk wN, #offset; add x0, xbase, wN, uxtw
+ *   movz/movk xN, #offset; add x0, xbase, xN
+ *   add x0, xbase, xN, lsl #shift
+ */
+static int find_offset_before_branch(unsigned long branch_pc,
+				     unsigned int *offset)
+{
+	int i;
+	int need_reg = 0; /* Start by tracking X0 (1st argument) */
+	enum need_kind need_kind = NEED_ADDR;
+	unsigned int need_shift = 0;
+	bool have_partial = false;
+	u64 partial_val = 0;
+	u64 partial_mask = 0;
+
+	for (i = 1; i <= BACK_SCAN_MAX; i++) {
+		unsigned long pc;
+		u32 insn;
+		unsigned int rd, rn, rm, hw;
+		unsigned long imm, imm16;
+		bool extended;
+		bool is64;
+		unsigned int add_shift;
+		enum wide_imm_op wtype;
+
+		/* Check underflow before computing pc. */
+		if ((unsigned long)i * 4 > branch_pc)
+			break;
+
+		pc = branch_pc - (unsigned long)i * 4;
+
+		if (hmkpm_copy_from_kernel_nofault(&insn,
+						   (const void *)pc,
+						   sizeof(insn)) != 0)
+			break;
+
+		/* Any branch/return means exiting the basic block. */
+		if (insn_is_control_transfer(insn))
+			break;
+
+		/* 1. MOV register forwarding (ORR Xd, XZR, Xm or ADD Xd, Xm, #0) */
+		if (insn_is_mov_reg(insn, &rd, &rm, &is64)) {
+			if (rd == (unsigned int)need_reg) {
+				if (rm == 31) /* Do not track XZR/SP */
+					break;
+
+				/* If we need a 64-bit address, 32-bit MOV is not sufficient */
+				if (need_kind == NEED_ADDR && !is64)
+					break;
+
+				need_reg = (int)rm;
+				continue;
+			}
+			continue;
+		}
+
+		/* 2. ADD/ADDS immediate */
+		if (insn_add_imm(insn, &rd, &rn, &imm)) {
+			if (rd == (unsigned int)need_reg) {
+				if (imm == 0) {
+					/* ADD Rd, Rn, #0 is MOV Rd, Rn */
+					if (rn == 31)
+						break;
+					need_reg = (int)rn;
+					continue;
+				}
+
+				/*
+				 * If searching for the final address:
+				 *   ADD X0, Xbase, #offset
+				 */
+				if (need_kind == NEED_ADDR &&
+				    rn != 31 &&
+				    offset_is_valid(imm)) {
+					*offset = (unsigned int)imm;
+					return 0;
+				}
+
+				/* Overwrote need_reg with invalid offset; stop */
+				break;
+			}
+			continue;
+		}
+
+		/* 3. ADD/ADDS register/extended (ADD X0, Xbase, Woffset, UXTW #shift) */
+		if (insn_is_add_reg(insn, &rd, &rn, &rm, &extended,
+				    &add_shift)) {
+			if (rd == (unsigned int)need_reg) {
+				int src;
+
+				if (need_kind != NEED_ADDR)
+					break;
+
+				src = choose_add_register_source(rn, rm,
+								 extended);
+				if (src < 0 || src == 31)
+					break;
+
+				need_reg = src;
+				need_kind = NEED_CONST;
+				need_shift = add_shift;
+				have_partial = false;
+				partial_val = 0;
+				partial_mask = 0;
+				continue;
+			}
+			continue;
+		}
+
+		/* 4. MOVZ/MOVK/MOVN wide immediate */
+		if (insn_wide_imm(insn, &rd, &hw, &imm16, &wtype)) {
+			if (rd == (unsigned int)need_reg) {
+				if (need_kind != NEED_CONST)
+					break;
+
+				if (wtype == WIDE_MOVN)
+					break;
+
+				if (wtype == WIDE_MOVK) {
+					u64 hw_mask = 0xffffULL << (hw * 16);
+
+					if (!have_partial) {
+						have_partial = true;
+						partial_val = 0;
+						partial_mask = 0;
+					}
+
+					if (!(partial_mask & hw_mask)) {
+						partial_val |= (u64)imm16 << (hw * 16);
+						partial_mask |= hw_mask;
+					}
+					continue;
+				}
+
+				if (wtype == WIDE_MOVZ) {
+					u64 movz_bits = (u64)imm16 << (hw * 16);
+					u64 val;
+
+					if (have_partial)
+						val = partial_val |
+						      (movz_bits & ~partial_mask);
+					else
+						val = movz_bits;
+
+					if (need_shift >= 64)
+						break;
+
+					val <<= need_shift;
+
+					if (offset_is_valid((unsigned long)val)) {
+						*offset = (unsigned int)val;
+						return 0;
+					}
+
+					break;
+				}
+			}
+			continue;
+		}
+
+		/* 5. Clobber check */
+		if (insn_may_write_reg(insn, (unsigned int)need_reg))
+			break;
+	}
+
+	return -ENOENT;
+}
+
+static void scan_function_for_lock_offset(unsigned long func,
+					  unsigned long size,
+					  int func_idx,
 					  const unsigned long *lock_addr,
 					  const unsigned long *lock_resolved)
 {
@@ -1150,7 +1621,9 @@ static void scan_function_for_lock_offset(unsigned long func, unsigned long size
 		unsigned long resolved_target;
 		int j;
 
-		if (hmkpm_copy_from_kernel_nofault(&insn, (const void *)pc, sizeof(insn)) != 0)
+		if (hmkpm_copy_from_kernel_nofault(&insn,
+						   (const void *)pc,
+						   sizeof(insn)) != 0)
 			break;
 
 		if (!insn_is_bl_or_b(pc, insn, &target))
@@ -1164,9 +1637,11 @@ static void scan_function_for_lock_offset(unsigned long func, unsigned long size
 			if (!lock_addr[j])
 				continue;
 
-			if (target == lock_addr[j] || resolved_target == lock_addr[j] ||
-			    (lock_resolved[j] && (target == lock_resolved[j] ||
-						 resolved_target == lock_resolved[j]))) {
+			if (target == lock_addr[j] ||
+			    resolved_target == lock_addr[j] ||
+			    (lock_resolved[j] &&
+			     (target == lock_resolved[j] ||
+			      resolved_target == lock_resolved[j]))) {
 				if (find_offset_before_branch(pc, &off) == 0)
 					add_probe_vote(off, func_idx);
 				break;
@@ -1179,17 +1654,29 @@ static int pick_consensus_offset(unsigned int *offset, int valid_funcs)
 {
 	int i;
 	int best = -1;
-	u32 best_count = 0;
+	int second = -1;
 	int best_pop = -1;
+	int second_pop = -1;
+	u32 best_count = 0;
+	u32 second_count = 0;
 
 	for (i = 0; i < nr_probe_votes; i++) {
 		int pop = __builtin_popcount((unsigned int)probe_votes[i].func_mask);
 
 		if (pop > best_pop ||
 		    (pop == best_pop && probe_votes[i].count > best_count)) {
+			second = best;
+			second_pop = best_pop;
+			second_count = best_count;
+
 			best = i;
-			best_count = probe_votes[i].count;
 			best_pop = pop;
+			best_count = probe_votes[i].count;
+		} else if (pop > second_pop ||
+			   (pop == second_pop && probe_votes[i].count > second_count)) {
+			second = i;
+			second_pop = pop;
+			second_count = probe_votes[i].count;
 		}
 	}
 
@@ -1197,17 +1684,22 @@ static int pick_consensus_offset(unsigned int *offset, int valid_funcs)
 		return -ENOENT;
 
 	/*
-	 * Require consensus across distinct functions or multiple occurrences,
-	 * or accept trusted vote if only one candidate function could be resolved.
+	 * Acceptance rules:
+	 * - Ideal: offset voted by >=2 distinct functions;
+	 * - Acceptable: >=2 occurrences in the same function;
+	 * - If only 1 candidate function is valid, accept 1 vote.
 	 */
-	if (best_pop < 2 && best_count < 2 && !(valid_funcs == 1 && best_count >= 1))
+	if (best_pop < 2 && best_count < 2 &&
+	    !(valid_funcs == 1 && best_count >= 1))
 		return -ENOENT;
 
-	if ((probe_votes[best].offset & 7) != 0)
-		return -EINVAL;
+	/* Technical tie between top two candidates: better to fail than guess */
+	if (second >= 0 &&
+	    second_pop == best_pop &&
+	    second_count == best_count)
+		return -ENOENT;
 
-	if (probe_votes[best].offset < OFFSET_MIN ||
-	    probe_votes[best].offset > OFFSET_MAX)
+	if (!offset_is_valid(probe_votes[best].offset))
 		return -EINVAL;
 
 	*offset = probe_votes[best].offset;
@@ -1220,11 +1712,13 @@ static int find_mm_mmap_sem_offset(unsigned int *offset)
 	unsigned long lock_resolved[NR_PROBE_LOCKS] = {0};
 	unsigned long func_addr[MAX_PROBE_FUNCS] = {0};
 	unsigned long func_size[MAX_PROBE_FUNCS] = {0};
-	int (*kf_kallsyms_lookup_size_offset)(unsigned long addr, unsigned long *symbolsize, unsigned long *offset) = NULL;
+	int (*kf_kallsyms_lookup_size_offset)(unsigned long addr,
+					      unsigned long *symbolsize,
+					      unsigned long *offset) = NULL;
 	unsigned int off = 0;
 	int valid_funcs = 0;
 	int valid_locks = 0;
-	int i, ret;
+	int i, j, ret;
 
 	if (!offset)
 		return -EINVAL;
@@ -1232,13 +1726,14 @@ static int find_mm_mmap_sem_offset(unsigned int *offset)
 	nr_probe_votes = 0;
 	kfunc(memset)(probe_votes, 0, sizeof(probe_votes));
 
-	/* Resolve symbols for lock functions and their canonical targets */
+	/* Resolve lock symbols and their canonical targets */
 	for (i = 0; i < NR_PROBE_LOCKS; i++) {
-		lock_addr[i] = hmkpm_lookup_symbol(lock_symbol_defs[i].name);
-		if (lock_addr[i]) {
-			lock_resolved[i] = resolve_branch_target(lock_addr[i]);
-			valid_locks++;
-		}
+		lock_addr[i] = hmkpm_lookup_symbol(lock_symbol_names[i]);
+		if (!lock_addr[i])
+			continue;
+
+		lock_resolved[i] = resolve_branch_target(lock_addr[i]);
+		valid_locks++;
 	}
 
 	if (valid_locks == 0) {
@@ -1246,17 +1741,35 @@ static int find_mm_mmap_sem_offset(unsigned int *offset)
 		return -ENOENT;
 	}
 
-	/*
-	 * Try to obtain exact function sizes via kallsyms_lookup_size_offset if
-	 * available
-	 */
+	/* Try to obtain real sizes via kallsyms_lookup_size_offset */
 	kf_kallsyms_lookup_size_offset =
-		(typeof(kf_kallsyms_lookup_size_offset))hmkpm_lookup_symbol("kallsyms_lookup_size_offset");
+		(typeof(kf_kallsyms_lookup_size_offset))
+		hmkpm_lookup_symbol("kallsyms_lookup_size_offset");
 
-	for (i = 0; i < MAX_PROBE_FUNCS; i++) {
+	for (i = 0; i < NR_PROBE_FUNCS; i++) {
+		func_addr[i] = hmkpm_lookup_symbol(probe_func_names[i]);
+		if (!func_addr[i])
+			continue;
+	}
+
+	/* Remove aliases/duplicates so votes are not inflated */
+	for (i = 0; i < NR_PROBE_FUNCS; i++) {
+		if (!func_addr[i])
+			continue;
+
+		for (j = 0; j < i; j++) {
+			if (func_addr[j] == func_addr[i]) {
+				func_addr[i] = 0;
+				break;
+			}
+		}
+	}
+
+	valid_funcs = 0;
+
+	for (i = 0; i < NR_PROBE_FUNCS; i++) {
 		unsigned long size = 0;
 
-		func_addr[i] = hmkpm_lookup_symbol(probe_func_names[i]);
 		if (!func_addr[i])
 			continue;
 
@@ -1264,7 +1777,10 @@ static int find_mm_mmap_sem_offset(unsigned int *offset)
 			kf_kallsyms_lookup_size_offset(func_addr[i], &size, NULL);
 
 		if (!size)
-			size = 256 * 4; /* Default: 256 instructions (1 KB) */
+			size = 512 * 4; /* Default: 512 instructions / 2 KiB */
+
+		if (size < 16 * 4)
+			size = 16 * 4;
 
 		func_size[i] = size & ~3UL;
 		valid_funcs++;
@@ -1275,9 +1791,12 @@ static int find_mm_mmap_sem_offset(unsigned int *offset)
 		return -ENOENT;
 	}
 
-	for (i = 0; i < MAX_PROBE_FUNCS; i++) {
-		if (func_addr[i])
-			scan_function_for_lock_offset(func_addr[i], func_size[i], i, lock_addr, lock_resolved);
+	for (i = 0; i < NR_PROBE_FUNCS; i++) {
+		if (!func_addr[i])
+			continue;
+
+		scan_function_for_lock_offset(func_addr[i], func_size[i], i,
+					      lock_addr, lock_resolved);
 	}
 
 	ret = pick_consensus_offset(&off, valid_funcs);
@@ -1287,7 +1806,9 @@ static int find_mm_mmap_sem_offset(unsigned int *offset)
 	}
 
 	*offset = off;
-	hmkpm_info("mmap_sem probe: dynamically resolved offset = 0x%x (%u)\n", off, off);
+	hmkpm_info("mmap_sem probe: dynamically resolved offset = 0x%x (%u)\n",
+		   off, off);
+
 	return 0;
 }
 
@@ -1305,8 +1826,7 @@ static inline int get_mm_mmap_lock_offset(void)
 		return 112;
 	} else {
 		/*
-		 * Kernels below 5.10 (pre-GKI): dynamically discovered via assembly
-		 * disassembly
+		 * Kernels below 5.10 (pre-GKI): dynamically discovered via assembly disassembly
 		 */
 		unsigned int off = 0;
 
