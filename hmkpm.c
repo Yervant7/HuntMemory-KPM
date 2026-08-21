@@ -22,7 +22,7 @@
 #include <uapi/asm-generic/unistd.h>
 
 KPM_NAME("HMKPM");
-KPM_VERSION("2.3.0");
+KPM_VERSION("2.3.1");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Yervant7");
 KPM_DESCRIPTION("A KernelPatch Module (KPM) HMKPM");
@@ -1221,32 +1221,65 @@ static bool insn_is_function_exit(u32 insn)
  */
 static bool insn_is_atomic_rwsem_op(u32 insn, unsigned int *rn)
 {
-	/* 1. 64-bit CAS / CASAL / CASA / CASL (LSE Atomics) */
-	if ((insn & 0xffa08000) == 0xc8a00000) {
-		*rn = a64_insn_rn(insn);
-		return (*rn != 31);
-	}
+    unsigned int r;
 
-	/* 2. 64-bit LDADD, SWP, LDCLR, LDSET, LDEOR (LSE Atomics) */
-	if ((insn & 0xff00fc00) == 0xf8000000) {
-		*rn = a64_insn_rn(insn);
-		return (*rn != 31);
-	}
+    /*
+     * 64-bit CAS / CASA / CASL / CASAL (LSE Atomics)
+     *
+     * Use a mask that ignores the variant bits but keeps the fixed class bits.
+     */
+    if ((insn & 0xffa07c00) == 0xc8a07c00) {
+        r = a64_insn_rn(insn);
+        if (r == 31)
+            return false;
+        *rn = r;
+        return true;
+    }
 
-	/* 3. 64-bit LDAXR / LDXR (LL/SC Load-Exclusive) */
-	if ((insn & 0xffe07c00) == 0xc85f7c00) {
-		*rn = a64_insn_rn(insn);
-		return (*rn != 31);
-	}
+    /*
+     * 64-bit LSE atomic memory operations:
+     * LDADD, LDCLR, LDEOR, LDSET, SWP.
+     *
+     * A/R variant bits are ignored by the mask 0xff20fc00.
+     */
+    switch (insn & 0xff20fc00) {
+    case 0xf8200000: /* LDADD / STADD */
+    case 0xf8201000: /* LDCLR */
+    case 0xf8202000: /* LDEOR */
+    case 0xf8203000: /* LDSET */
+    case 0xf8208000: /* SWP */
+        r = a64_insn_rn(insn);
+        if (r == 31)
+            return false;
+        *rn = r;
+        return true;
+    }
 
-	/* 4. 64-bit STLXR / STXR (LL/SC Store-Exclusive) */
-	if ((insn & 0xffe07c00) == 0xc8007c00 ||
-	    (insn & 0xffe07c00) == 0xc800fc00) {
-		*rn = a64_insn_rn(insn);
-		return (*rn != 31);
-	}
+    /*
+     * 64-bit LDXR / LDAXR (LL/SC Load-Exclusive)
+     */
+    if ((insn & 0xfffffc00) == 0xc85f7c00 || /* LDXR */
+        (insn & 0xfffffc00) == 0xc85ffc00) { /* LDAXR */
+        r = a64_insn_rn(insn);
+        if (r == 31)
+            return false;
+        *rn = r;
+        return true;
+    }
 
-	return false;
+    /*
+     * 64-bit STLXR / STXR (LL/SC Store-Exclusive)
+     */
+    if ((insn & 0xffe0fc00) == 0xc8007c00 || /* STLXR */
+        (insn & 0xffe0fc00) == 0xc800fc00) { /* STXR */
+        r = a64_insn_rn(insn);
+        if (r == 31)
+            return false;
+        *rn = r;
+        return true;
+    }
+
+    return false;
 }
 
 /*
