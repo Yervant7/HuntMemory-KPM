@@ -13,6 +13,7 @@
 #include <kputils.h>
 #include <ksyms.h>
 #include <ktypes.h>
+#include <linux/bitops.h>
 #include <linux/err.h>
 #include <linux/errno.h>
 #include <linux/kernel.h>
@@ -22,7 +23,7 @@
 #include <uapi/asm-generic/unistd.h>
 
 KPM_NAME("HMKPM");
-KPM_VERSION("2.3.3");
+KPM_VERSION("2.3.4");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Yervant7");
 KPM_DESCRIPTION("A KernelPatch Module (KPM) HMKPM");
@@ -1888,7 +1889,7 @@ static int pick_consensus_offset(unsigned int *offset, int valid_funcs)
 	u32 second_count = 0;
 
 	for (i = 0; i < nr_probe_votes; i++) {
-		int pop = __builtin_popcount((unsigned int)probe_votes[i].func_mask);
+		int pop = hweight32(probe_votes[i].func_mask);
 
 		if (pop > best_pop ||
 		    (pop == best_pop && probe_votes[i].count > best_count)) {
