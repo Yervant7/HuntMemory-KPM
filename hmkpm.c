@@ -24,7 +24,7 @@
 #include <uapi/asm-generic/unistd.h>
 
 KPM_NAME("HMKPM");
-KPM_VERSION("2.4.0");
+KPM_VERSION("2.4.1");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Yervant7");
 KPM_DESCRIPTION("A KernelPatch Module (KPM) HMKPM");
@@ -324,22 +324,19 @@ static inline int validate_virt_range(uint64_t va, uint64_t size)
 
 static inline int validate_phys_range(uint64_t phys, uint64_t size)
 {
-	uint64_t last;
+	uint64_t va;
 
 	if (unlikely(size == 0))
 		return -EINVAL;
 
-	if (unlikely(phys < pgt_phys_offset))
+	if (unlikely((phys >> 48) != 0))
 		return -EFAULT;
 
 	if (unlikely(phys > U64_MAX - size))
 		return -EFAULT;
 
-	last = phys + size - 1;
-	if (unlikely(last >= pgt_phys_limit))
-		return -EFAULT;
-
-	return 0;
+	va = pgt_phys_to_virt(phys);
+	return validate_virt_range(va, size);
 }
 
 static inline uint64_t pgt_untag_user_va(uint64_t va)
