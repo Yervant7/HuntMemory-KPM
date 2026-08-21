@@ -22,7 +22,7 @@
 #include <uapi/asm-generic/unistd.h>
 
 KPM_NAME("HMKPM");
-KPM_VERSION("2.3.1");
+KPM_VERSION("2.3.2");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Yervant7");
 KPM_DESCRIPTION("A KernelPatch Module (KPM) HMKPM");
@@ -2070,7 +2070,31 @@ static long module_init_handler(const char *args, const char *event, void *__use
 		return -ENOENT;
 	}
 
-	hkfunc_match(memset);
+	static const char *const arm64_memset_aliases[] = {
+        "__memset",
+        "memset",
+        "__pi___memset",    /* PIE/KASLR stub */
+        "__pi_memset",      /* PIE alias */
+        "__asan_memset",    /* KASAN generic */
+        "__hwasan_memset",  /* KASAN HW-tags (Kernel 5.11+) */
+        "__mte_memset",     /* MTE tag memset (Kernel 5.10+) */
+        "__arch_memset",    /* Custom vendor kernel (Qualcomm/MediaTek) */
+        NULL
+    };
+
+    for (int i = 0; arm64_memset_aliases[i] != NULL; i++) {
+        kf_memset = (typeof(kf_memset))hmkpm_lookup_symbol(arm64_memset_aliases[i]);
+        if (kf_memset) {
+            hmkpm_info("Resolved memset via symbol: %s (at %lx)\n", arm64_memset_aliases[i], kf_memset);
+            break;
+        }
+	}
+
+	if (!kf_memset) {
+		hmkpm_error("Failed to find kfunc memset\n");
+		init_error = true;
+	}
+
 	kf___arch_copy_to_user =
 		(typeof(kf___arch_copy_to_user))hmkpm_lookup_symbol("__arch_copy_to_user");
 	if (!kf___arch_copy_to_user)
