@@ -22,7 +22,7 @@
 #include <uapi/asm-generic/unistd.h>
 
 KPM_NAME("HMKPM");
-KPM_VERSION("2.3.2");
+KPM_VERSION("2.3.3");
 KPM_LICENSE("GPL v2");
 KPM_AUTHOR("Yervant7");
 KPM_DESCRIPTION("A KernelPatch Module (KPM) HMKPM");
@@ -41,6 +41,14 @@ extern int kp_kconfig_enabled(const char *name) __attribute__((weak));
 #define hmkpm_info(fmt, ...)        logki(HMKPM_TAG fmt, ##__VA_ARGS__)
 #define hmkpm_warn(fmt, ...)        logkw(HMKPM_TAG fmt, ##__VA_ARGS__)
 #define hmkpm_error(fmt, ...)       logke(HMKPM_TAG fmt, ##__VA_ARGS__)
+
+void *memset(void *s, int c, size_t count)
+{
+    unsigned char *p = (unsigned char *)s;
+    while (count--)
+        *p++ = (unsigned char)c;
+    return s;
+}
 
 static inline void make_cfi_name(char *dst, size_t dst_size, const char *name)
 {
