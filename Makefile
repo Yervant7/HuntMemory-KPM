@@ -10,6 +10,8 @@ endif
 CC = $(TARGET_COMPILE)gcc
 LD = $(TARGET_COMPILE)ld
 
+CFLAGS += -fno-builtin-memset -fno-builtin -mgeneral-regs-only
+
 INCLUDE_DIRS := . include patch/include linux/include linux/arch/arm64/include linux/tools/arch/arm64/include
 
 INCLUDE_FLAGS := $(foreach dir,$(INCLUDE_DIRS),-I$(KP_DIR)/$(dir))
