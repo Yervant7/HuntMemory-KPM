@@ -27,9 +27,8 @@ build/*
 
 # 
 *.bin
-*.elf
-
 *.kpm
 
 # 
 private
+/.idea/

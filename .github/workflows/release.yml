@@ -25,7 +25,10 @@ jobs:
       - name: Extract version from source
         id: vars
         run: |
-          VERSION=$(grep -oP 'KPM_VERSION\("?\K[^")]+' hmkpm.c)
+          VERSION=$(grep -oP '#define\s+HMKPM_VERSION_STR\s+"\K[^"]+' hmkpm.c || true)
+          if [ -z "$VERSION" ]; then
+            VERSION=$(grep -oP 'KPM_VERSION\("\K[^"]+' hmkpm.c || true)
+          fi
           if [ -z "$VERSION" ]; then
             echo "ERROR: Could not extract version from hmkpm.c"
             exit 1

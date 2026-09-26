@@ -106,26 +106,64 @@ syscall(__NR_getresuid, magic, user_buffer, total_size);
 
 | Identifier | Value | Operation |
 | :--- | :--- | :--- |
-| `HMKPM_MAGIC` | `0x484D4B504D` | Handshake / Availability Check |
+| `HMKPM_MAGIC` | `0x484D4B504D` | Handshake / Probe (Returns version in `ret` & `struct hmkpm_version_info`) |
 | `HMKPM_MAGIC_READ` | `0x484D4B504E` | Single Process Memory Read |
 | `HMKPM_MAGIC_WRITE` | `0x484D4B504F` | Single Process Memory Write |
 | `HMKPM_MAGIC_READ_BATCH` | `0x484D4B5050` | Batch Process Memory Read |
 | `HMKPM_MAGIC_WRITE_BATCH` | `0x484D4B5051` | Batch Process Memory Write |
+| `HMKPM_MAGIC_V2P_BATCH` | `0x484D4B5052` | Direct Virtual-to-Physical Translation Batch |
+| `HMKPM_MAGIC_SCAN_KERNEL` | `0x484D4B5053` | Accelerated In-Kernel Memory Scanner |
 
 ### Memory Layouts
 
-#### 1. Single Request Layout
+#### 1. Probe / Handshake Layout
+```c
+struct hmkpm_version_info {
+    uint64_t magic;            /* HMKPM_MAGIC (0x484D4B504D) */
+    uint32_t version_code;     /* (major << 16) | (minor << 8) | patch */
+    uint16_t version_major;    /* Major version */
+    uint16_t version_minor;    /* Minor version */
+    uint16_t version_patch;    /* Patch version */
+    uint8_t  is_lockless;      /* 1 if running in lockless mode, 0 if mmap_lock active */
+    uint8_t  _pad;
+    int32_t  mmap_lock_offset; /* Resolved offset in mm_struct, or -1 if lockless */
+    uint64_t features;         /* Active features (includes HMKPM_FEATURE_LOCKLESS if lockless) */
+    char     version_str[16];  /* Version string (e.g. "2.8.0") */
+};
+
+syscall(__NR_getresuid, HMKPM_MAGIC, &version_info, sizeof(version_info));
+// ret: ((version_code << 40) | HMKPM_MAGIC)
+// user_buffer: struct hmkpm_version_info (48 bytes)
+```
+
+#### 2. Single Request Layout
 
 ```
 [ struct hmkpm_req (24 bytes) ] [ Data Payload (size bytes) ]
 ```
 
-#### 2. Batch Request Layout
+#### 3. Batch Request Layout
 
 ```
 [ struct hmkpm_batch_hdr (24 bytes) ]
 [ struct hmkpm_batch_entry[count] (16 bytes each) ]
 [ Data Payload (data_total bytes) ]
+```
+
+#### 4. V2P Batch Layout
+
+```
+[ struct hmkpm_v2p_hdr (16 bytes) ]
+[ struct hmkpm_v2p_entry[count] (24 bytes each) ]
+```
+
+#### 5. Kernel Memory Scan Layout
+
+```
+[ struct hmkpm_scan_hdr (48 bytes) ]
+[ struct hmkpm_scan_range[range_count] (16 bytes each) ]
+[ Pattern / Mask Bytes (optional) ]
+[ Output Matches: uint64_t[max_matches] ]
 ```
 
 ---
