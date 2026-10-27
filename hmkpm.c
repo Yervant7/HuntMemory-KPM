@@ -27,11 +27,11 @@
 
 #define HMKPM_VERSION_MAJOR	2
 #define HMKPM_VERSION_MINOR	8
-#define HMKPM_VERSION_PATCH	0
+#define HMKPM_VERSION_PATCH	1
 #define HMKPM_VERSION_CODE	(((uint32_t)HMKPM_VERSION_MAJOR << 16) | \
 				 ((uint32_t)HMKPM_VERSION_MINOR << 8) | \
 				 ((uint32_t)HMKPM_VERSION_PATCH))
-#define HMKPM_VERSION_STR	"2.8.0"
+#define HMKPM_VERSION_STR	"2.8.1"
 
 KPM_NAME("HMKPM");
 KPM_VERSION(HMKPM_VERSION_STR);
@@ -3415,8 +3415,7 @@ static long module_init_handler(const char *args, const char *event, void *__use
 		}
 	}
 
-
-	err = hook_syscalln(__NR_getresuid, 3, (void *)hmkpm_handle, 0, 0);
+	err = hook_syscalln_override(__NR_getresuid, 3, hmkpm_handle, 0, 0);
 	if (err) {
 		hmkpm_error("install hook error: %d\n", err);
 		if (fsnotify_hooked && fsnotify_addr) {
