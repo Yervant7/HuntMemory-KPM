@@ -1,4 +1,0 @@
-[submodule "KPM-Headers"]
-	path = KPM-Headers
-	url = https://github.com/Yervant7/KernelPatch
-	branch = KPM-Headers
