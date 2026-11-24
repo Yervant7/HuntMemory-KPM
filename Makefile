@@ -9,23 +9,25 @@ endif
 CC = $(TARGET_COMPILE)gcc
 LD = $(TARGET_COMPILE)ld
 
-CFLAGS += -Wall -O2 -std=gnu11 -fno-builtin -fno-builtin-memset -fno-pic -fno-PIC -fno-pie -fno-PIE -fno-asynchronous-unwind-tables -fno-unwind-tables
-CFLAGS += -fno-stack-protector -fno-common -mgeneral-regs-only -mcmodel=small
+CFLAGS += -Wall -Werror=implicit-function-declaration -Wundef -O2 -std=gnu11
+CFLAGS += -fno-builtin -fno-builtin-memset -fno-pic -fno-PIC -fno-pie -fno-PIE
+CFLAGS += -fno-asynchronous-unwind-tables -fno-unwind-tables
+CFLAGS += -fno-stack-protector -fno-common -mgeneral-regs-only -mcmodel=small $(EXTRA_CFLAGS)
 
-INCLUDE_DIRS := . include patch/include linux/include linux/arch/arm64/include linux/tools/arch/arm64/include
+KP_INCLUDE_DIRS := include patch/include linux/include linux/arch/arm64/include linux/tools/arch/arm64/include
+INCLUDE_FLAGS := -Iinclude -Isrc -isystem $(KP_DIR) $(foreach dir,$(KP_INCLUDE_DIRS),-isystem $(KP_DIR)/$(dir))
 
-INCLUDE_FLAGS := $(foreach dir,$(INCLUDE_DIRS),-I$(KP_DIR)/$(dir))
-
-objs := hmkpm.o
+HEADERS := include/hmkpm_uapi.h src/hmkpm_internal.h
+objs := src/main.o src/sw_pan.o src/mmu.o src/io.o src/scan.o src/fsnotify_filter.o src/disasm_legacy.o
 
 all: hmkpm.kpm
 
 hmkpm.kpm: ${objs}
 	${LD} -r -o $@ $^
 
-%.o: %.c
+%.o: %.c $(HEADERS)
 	${CC} $(CFLAGS) $(INCLUDE_FLAGS) -c -o $@ $<
 
 .PHONY: clean
 clean:
-	rm -f *.kpm *.o
+	rm -f hmkpm.kpm *.kpm *.o src/*.o

@@ -13,7 +13,6 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@v7
         with:
-          submodules: "recursive"
           fetch-depth: 0
 
       - name: Install Compiler
@@ -25,12 +24,12 @@ jobs:
       - name: Extract version from source
         id: vars
         run: |
-          VERSION=$(grep -oP '#define\s+HMKPM_VERSION_STR\s+"\K[^"]+' hmkpm.c || true)
+          VERSION=$(grep -oP '#define\s+HMKPM_VERSION_STR\s+"\K[^"]+' include/hmkpm_uapi.h || true)
           if [ -z "$VERSION" ]; then
-            VERSION=$(grep -oP 'KPM_VERSION\("\K[^"]+' hmkpm.c || true)
+            VERSION=$(grep -oP 'KPM_VERSION\("\K[^"]+' src/main.c || true)
           fi
           if [ -z "$VERSION" ]; then
-            echo "ERROR: Could not extract version from hmkpm.c"
+            echo "ERROR: Could not extract version from include/hmkpm_uapi.h or src/main.c"
             exit 1
           fi
           echo "Extracted version: $VERSION"
@@ -39,6 +38,7 @@ jobs:
       - name: Build KPM
         run: |
           export PATH="$(pwd)/arm-gnu-toolchain-12.2.rel1-x86_64-aarch64-none-elf/bin:$PATH"
+          make clean
           make
           if [ ! -f hmkpm.kpm ]; then
             echo "ERROR: hmkpm.kpm not found after build"
@@ -52,6 +52,7 @@ jobs:
           name: Release ${{ steps.vars.outputs.VERSION }}
           artifacts: |
             hmkpm.kpm
+            include/hmkpm_uapi.h
             LICENSE
           token: ${{ secrets.GITHUB_TOKEN }}
           allowUpdates: true

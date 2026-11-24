@@ -27,7 +27,7 @@ trigger: always_on
 
 Style
 
-- Pure C focused on embedded Linux Kernel (Android 4.0 to 6.12).
+- Pure C focused on embedded Linux Kernel (Android 4.14 to 6.12).
 
 Safety
 
